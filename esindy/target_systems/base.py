@@ -81,8 +81,13 @@ class TargetSystem(ABC):
         defaults = dict(method="RK45", rtol=1e-10, atol=1e-12, dense_output=False)
         defaults.update(ivp_kwargs)
 
-        sol = solve_ivp(
-            self.rhs, t_span, x0, t_eval=t_eval, **defaults
+        sol = solve_ivp(self.rhs, 
+                        t_span, x0, 
+                        t_eval=t_eval,
+                        method=ivp_kwargs.get("method", "RK45"),
+                        rtol=ivp_kwargs.get("rtol", 1e-10),
+                        atol=ivp_kwargs.get("atol", 1e-12),
+                        dense_output=ivp_kwargs.get("dense_output", False), 
         )
         if not sol.success:
             raise RuntimeError(f"Integration failed: {sol.message}")
@@ -125,11 +130,11 @@ class TargetSystem(ABC):
               initialized to all False
         """
         rng = np.random.default_rng(seed)
-        ic_ranges = np.asarray(ic_ranges)  # (n_species, 2)
+        ic_array = np.asarray(ic_ranges)  # (n_species, 2)
 
         ICs = np.column_stack([
             rng.uniform(low, high, size=n_experiments)
-            for low, high in ic_ranges
+            for low, high in ic_array
         ])
 
         n_t = len(t_eval)
