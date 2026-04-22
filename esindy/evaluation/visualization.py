@@ -10,6 +10,7 @@ Provides plotting functions for:
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from typing import Optional
 
@@ -18,7 +19,7 @@ def plot_learning_curves(
     results: dict[str, dict],
     title: str = "Active Learning Comparison",
     figsize: tuple = (12, 5),
-) -> plt.Figure:
+) -> Figure:
     """Plot coefficient error and success rate vs. number of measurements.
 
     Parameters
@@ -52,7 +53,7 @@ def plot_inclusion_probabilities(
     esindy_result,
     species_names: Optional[list[str]] = None,
     figsize: tuple = (8, 6),
-) -> plt.Figure:
+) -> Figure:
     """Heatmap of inclusion probabilities.
 
     Parameters
@@ -95,7 +96,7 @@ def plot_coefficient_convergence(
     species_names: Optional[list[str]] = None,
     max_terms: int = 6,
     figsize: tuple = (14, 8),
-) -> plt.Figure:
+) -> Figure:
     """Plot convergence of active coefficients over AL steps.
 
     Parameters
@@ -117,6 +118,7 @@ def plot_coefficient_convergence(
     if n_species == 1:
         axes = [axes]
 
+    axes = np.asarray(axes)
     steps = [log.step for log in logs if log.coefficients is not None]
 
     for j in range(n_species):
@@ -149,7 +151,7 @@ def plot_trajectories(
     species_names: Optional[list[str]] = None,
     title: str = "Trajectory Comparison",
     figsize: tuple = (12, 6),
-) -> plt.Figure:
+) -> Figure:
     """Plot true vs. predicted trajectories.
 
     Parameters
@@ -163,9 +165,7 @@ def plot_trajectories(
         species_names = [f"x{i}" for i in range(n_species)]
 
     fig, axes = plt.subplots(n_species, 1, figsize=figsize, sharex=True)
-    if n_species == 1:
-        axes = [axes]
-
+    axes = np.asarray(axes)
     for j in range(n_species):
         axes[j].plot(t, true_traj[:, j], "k-", label="True", linewidth=1.5)
         axes[j].plot(t, pred_traj[:, j], "r--", label="Predicted", linewidth=1.5)

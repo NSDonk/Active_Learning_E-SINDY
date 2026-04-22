@@ -16,9 +16,9 @@ class LotkaVolterra(TargetSystem):
     def __init__(
         self,
         alpha: float = 1.0,
-        beta: float = 0.1,
-        delta: float = 1.5,
-        gamma: float = 0.075,
+        beta: float = 1.0,
+        delta: float = 1.0,
+        gamma: float = 1.0,
     ):
         self.alpha = alpha
         self.beta = beta
@@ -59,11 +59,3 @@ class LotkaVolterra(TargetSystem):
             },
         }
 
-    @staticmethod
-    def default_ic_ranges() -> list[tuple[float, float]]:
-        """Reasonable IC ranges for pool generation."""
-        return [(10.0, 50.0), (5.0, 25.0)]
-
-    @staticmethod
-    def default_t_eval(n_points: int = 200) -> np.ndarray:
-        return np.linspace(0, 30, n_points)
