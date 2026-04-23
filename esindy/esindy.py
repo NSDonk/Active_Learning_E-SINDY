@@ -1,5 +1,5 @@
 """
-E-SINDy: Ensemble Sparse Identification of Nonlinear Dynamics.
+E-SINDy: Ensemble Sparse Identification of Nonlinear Dynamics
 
 Wraps PySINDy to provide:
 - Single SINDy model fitting (baseline)
@@ -13,43 +13,92 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.integrate import solve_ivp
 import pysindy as ps
+from .SINDy_PI import SINDyPI
+from pysindy.optimizers import EnsembleOptimizer
 
 
-# ======================================================================
+
 # Configuration
-# ======================================================================
-
 @dataclass
 class SINDyConfig:
     """Configuration for PySINDy model construction."""
 
-    # Library settings
+    # Library selection
+    library_type: str = "polynomial"   # or "pde"
+    
+    # Polynomial library setting
     poly_degree: int = 2
     include_interaction: bool = True
-    include_bias: bool = True  # constant term in library
+    include_bias: bool = False  # constant term in library
 
+    # PDE / SINDyPI library settings
+    library_functions: Optional[ps.CustomLibrary] = None
+    function_names: Optional[list[str]] = None
+    derivative_order: int = 1
+    implicit_terms: bool = False
+    temporal_grid: Optional[np.ndarray] = None
+    
     # Optimizer settings
-    optimizer: str = "STLSQ"  # or "SR3", "SSR"
-    threshold: float = 0.1
-    alpha: float = 0.05       # ridge regularization (for STRidge-like behavior)
+    optimizer: str = "STLSQ"  # or "SINDyPI" "SR3", "SSR"
+    threshold: float = 0.05   
+    alpha: float = 0.05       # ridge regularization
     max_iter: int = 20
+    use_ensemble: bool = False
+    n_models: int = 100
+    replace: bool = True
 
     # Differentiation
-    diff_method: str = "finite_difference"  # or "smoothed_finite_difference"
-
-    # Feature names (set by caller based on target system)
+    diff_method: str = "smoothed_finite_difference"  # or "_finite_difference"
+    drop_endpoints: bool = True  # whether to drop endpoints after differentiation (can help with noise)
+    
+    # Input feature names for the state variables
     feature_names: Optional[list[str]] = None
+    
+    def build_library(self):
+        if self.library_type == "polynomial":
+            return ps.PolynomialLibrary(
+                degree=self.poly_degree,
+                include_interaction=self.include_interaction,
+                include_bias=self.include_bias,
+            )
+        elif self.library_type == "pde":
+            if self.library_functions is None:
+                raise ValueError("For library_type='pde', provide library_functions and optionally function_names.")
 
-    def build_library(self) -> ps.PolynomialLibrary:
-        return ps.PolynomialLibrary(
-            degree=self.poly_degree,
-            include_interaction=self.include_interaction,
-            include_bias=self.include_bias,
-        )
+            if self.implicit_terms and self.temporal_grid is None:
+                raise ValueError("temporal_grid must be provided when implicit_terms=True.")
+            
+            # Ideally user passes  a feature-library object to be used directly
+            if hasattr(self.library_functions, "fit") and hasattr(self.library_functions, "transform"):
+                base_lib = self.library_functions
+            
+            #  but if they pass a list of functions instead we can wrap it in a CustomLibrary for them
+            else:
+                base_lib = ps.CustomLibrary(
+                    library_functions=self.library_functions,
+                    function_names=self.function_names,
+                )
+                
+            return ps.PDELibrary(
+                function_library=base_lib,
+                derivative_order=self.derivative_order,
+                include_bias=self.include_bias,
+                implicit_terms=self.implicit_terms,
+                temporal_grid=self.temporal_grid,
+                include_interaction=self.include_interaction,
+            )
+        else:
+            raise ValueError(f"Unknown library_type: {self.library_type}")
 
-    def build_optimizer(self) -> ps.STLSQ:
+    def build_optimizer(self):
         if self.optimizer == "STLSQ":
-            return ps.STLSQ(
+            base_opt = ps.STLSQ(
+                threshold=self.threshold,
+                alpha=self.alpha,
+                max_iter=self.max_iter,
+            )
+        elif self.optimizer == "SINDyPI":
+            base_opt = SINDyPI(
                 threshold=self.threshold,
                 alpha=self.alpha,
                 max_iter=self.max_iter,
@@ -57,28 +106,30 @@ class SINDyConfig:
         else:
             raise ValueError(f"Optimizer '{self.optimizer}' not yet supported")
 
+        if self.use_ensemble:
+            return ps.EnsembleOptimizer(
+                opt=base_opt,
+                bagging=True,
+                n_models=self.n_models,
+                replace=self.replace,
+            )
+        return base_opt
+    
     def build_differentiator(self):
         if self.diff_method == "finite_difference":
-            return ps.FiniteDifference()
+            return ps.FiniteDifference(drop_endpoints=self.drop_endpoints)
         elif self.diff_method == "smoothed_finite_difference":
-            return ps.SmoothedFiniteDifference()
+            return ps.SmoothedFiniteDifference(drop_endpoints=self.drop_endpoints)
         else:
             raise ValueError(f"Unknown diff method: {self.diff_method}")
 
 
-# ======================================================================
 # Result containers
-# ======================================================================
-
 @dataclass
 class SINDyResult:
     """Result from a single SINDy fit."""
     model: ps.SINDy
     coefficients: np.ndarray   # (n_features_in_library, n_species)
-    feature_names: list[str]
-
-    def print_model(self):
-        self.model.print()
 
 
 @dataclass
@@ -87,7 +138,6 @@ class ESINDyResult:
 
     # Aggregated model
     coefficients: np.ndarray        # (n_library_terms, n_species) — aggregated
-    feature_names: list[str]
 
     # Ensemble statistics
     all_coefficients: np.ndarray    # (n_bootstraps, n_library_terms, n_species)
@@ -98,28 +148,7 @@ class ESINDyResult:
     config: SINDyConfig = field(default_factory=SINDyConfig)
     aggregation: str = "mean"
 
-    def get_active_terms(self, threshold: float = 0.5) -> dict:
-        """Return terms with inclusion probability above threshold, per species."""
-        result = {}
-        n_species = self.coefficients.shape[1]
-        species_names = self.config.feature_names or [f"x{i}" for i in range(n_species)]
-
-        for j in range(n_species):
-            terms = []
-            for i, fname in enumerate(self.feature_names):
-                if self.inclusion_probabilities[i, j] >= threshold:
-                    terms.append((
-                        fname,
-                        self.coefficients[i, j],
-                        self.inclusion_probabilities[i, j],
-                    ))
-            result[species_names[j]] = terms
-        return result
-
-
-# ======================================================================
 # Fitting functions
-# ======================================================================
 
 def fit_sindy(
     X: np.ndarray,
@@ -147,21 +176,25 @@ def fit_sindy(
         feature_library=config.build_library(),
         optimizer=config.build_optimizer(),
         differentiation_method=config.build_differentiator(),
-        feature_names=config.feature_names,
     )
 
+    # bare minimum fit requires time; keywords only if provided by user
+    fit_kwargs = {
+        "t": t,
+        "feature_names": config.feature_names,
+    }
+
+    # if we have precomputed derivatives pass them to avoid redundancy
     if X_dot is not None:
-        model.fit(X, t=t, x_dot=X_dot)
-    else:
-        model.fit(X, t=t)
+        fit_kwargs["x_dot"] = X_dot
+
+    model.fit(X, **fit_kwargs)
 
     coefs = model.coefficients()  # (n_species, n_library_terms)
-    fnames = model.get_feature_names()
 
     return SINDyResult(
         model=model,
         coefficients=coefs.T,  # transpose to (n_library_terms, n_species)
-        feature_names=fnames,
     )
 
 
@@ -169,10 +202,7 @@ def fit_esindy(
     X: np.ndarray,
     t: np.ndarray,
     config: Optional[SINDyConfig] = None,
-    X_dot: Optional[np.ndarray] = None,
-    n_bootstraps: int = 100,
     aggregation: Literal["mean", "median"] = "median",
-    inclusion_threshold: float = 0.5,
     seed: int = 42,
 ) -> ESINDyResult:
     """Fit an ensemble of SINDy models via bagging.
@@ -195,63 +225,26 @@ def fit_esindy(
     if config is None:
         config = SINDyConfig()
 
-    rng = np.random.default_rng(seed)
-    m = X.shape[0]
+    if not config.use_ensemble:
+        raise ValueError("config.use_ensemble must be True to use fit_esindy")
 
-    # First fit to get library size and feature names
-    ref_result = fit_sindy(X, t, config, X_dot)
-    n_lib = len(ref_result.feature_names)
-    n_species = X.shape[1]
+    result = fit_sindy(X, t, config)
+    ensemble_opt = result.model.optimizer
+    assert isinstance(ensemble_opt, EnsembleOptimizer)      
+    coef_list = np.array(ensemble_opt.coef_list)  # (n_models, n_species, n_lib)
+    coef_list = coef_list.transpose(0, 2, 1)                # (n_models, n_lib, n_species)
 
-    all_coefs = np.zeros((n_bootstraps, n_lib, n_species))
+    inclusion_probs = (coef_list != 0).mean(axis=0)         # (n_lib, n_species)
+    coef_std = coef_list.std(axis=0)
 
-    for b in range(n_bootstraps):
-        # Bootstrap: sample m rows with replacement
-        idx = rng.choice(m, size=m, replace=True)
-        X_b = X[idx]
-        t_b = t[idx]
-        sort_order = np.argsort(t_b)
-        X_b = X_b[sort_order]
-        t_b = t_b[sort_order]
-
-        # Remove duplicate timepoints (can cause issues)
-        unique_mask = np.concatenate([[True], np.diff(t_b) > 0])
-        X_b = X_b[unique_mask]
-        t_b = t_b[unique_mask]
-
-        if len(t_b) < 5:
-            continue
-
-        Xdot_b = None
-        if X_dot is not None:
-            Xdot_b = X_dot[idx][sort_order][unique_mask]
-
-        try:
-            result = fit_sindy(X_b, t_b, config, Xdot_b)
-            all_coefs[b] = result.coefficients
-        except Exception:
-            # Some bootstraps may fail — skip them
-            continue
-
-    # Compute inclusion probabilities
-    nonzero = all_coefs != 0  # (n_bootstraps, n_lib, n_species)
-    inclusion_probs = nonzero.mean(axis=0)  # (n_lib, n_species)
-
-    # Aggregate coefficients
     if aggregation == "mean":
-        agg_coefs = all_coefs.mean(axis=0)
-    else:  # median
-        agg_coefs = np.median(all_coefs, axis=0)
-
-    # Threshold by inclusion probability
-    agg_coefs[inclusion_probs < inclusion_threshold] = 0.0
-
-    coef_std = all_coefs.std(axis=0)
+        agg_coefs = coef_list.mean(axis=0)
+    else:
+        agg_coefs = np.median(coef_list, axis=0)
 
     return ESINDyResult(
         coefficients=agg_coefs,
-        feature_names=ref_result.feature_names,
-        all_coefficients=all_coefs,
+        all_coefficients=coef_list,
         inclusion_probabilities=inclusion_probs,
         coefficient_std=coef_std,
         config=config,
@@ -259,9 +252,7 @@ def fit_esindy(
     )
 
 
-# ======================================================================
 # Ensemble forecasting
-# ======================================================================
 
 def ensemble_forecast(
     esindy_result: ESINDyResult,
@@ -314,7 +305,7 @@ def ensemble_forecast(
                 (t_eval[0], t_eval[-1]),
                 x0,
                 t_eval=t_eval,
-                method="RK45",
+                method="LSODA",
                 rtol=1e-8,
                 atol=1e-10,
                 max_step=0.1,
@@ -334,3 +325,4 @@ def ensemble_forecast(
     var_traj = traj_array.var(axis=0)
 
     return mean_traj, var_traj
+

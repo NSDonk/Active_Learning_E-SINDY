@@ -11,9 +11,7 @@ import numpy as np
 from typing import Optional
 
 
-# ======================================================================
 # Derivative estimation
-# ======================================================================
 
 def estimate_derivatives(
     X: np.ndarray,
@@ -82,14 +80,12 @@ def _savgol_derivative(
             # Apply to valid contiguous blocks
             X_dot[valid, j] = savgol_filter(
                 col[valid], window_length=min(window, valid.sum()),
-                polyorder=polyorder, deriv=1, delta=dt
+                polyorder=polyorder, deriv=1, delta=float(dt)
             )
     return X_dot
 
 
-# ======================================================================
 # Data tensor operations
-# ======================================================================
 
 def get_revealed_data(pool: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract revealed (non-masked) data from the pool as SINDy-ready matrices.
@@ -174,21 +170,6 @@ def _find_contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
-def reveal_window(
-    pool: dict,
-    experiment_idx: int,
-    species_idx: int,
-    time_start_idx: int,
-    window_size: int,
-) -> None:
-    """Reveal a window of timepoints for a specific species in an experiment.
-
-    Modifies pool['revealed'] in-place.
-    """
-    end_idx = min(time_start_idx + window_size, pool["revealed"].shape[1])
-    pool["revealed"][experiment_idx, time_start_idx:end_idx, species_idx] = True
-
-
 def reveal_full_trajectories(
     pool: dict,
     experiment_indices: list[int],
@@ -196,13 +177,3 @@ def reveal_full_trajectories(
     """Reveal all species at all timepoints for given experiments."""
     for idx in experiment_indices:
         pool["revealed"][idx, :, :] = True
-
-
-def count_revealed(pool: dict) -> int:
-    """Total number of revealed (experiment, timepoint, species) entries."""
-    return int(pool["revealed"].sum())
-
-
-def fraction_revealed(pool: dict) -> float:
-    """Fraction of the data tensor that has been revealed."""
-    return pool["revealed"].mean()

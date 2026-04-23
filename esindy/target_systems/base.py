@@ -17,9 +17,8 @@ from scipy.integrate import solve_ivp
 class TargetSystem(ABC):
     """Oracle interface for a ground-truth ODE system."""
 
-    # ------------------------------------------------------------------
-    # Subclasses must implement these
-    # ------------------------------------------------------------------
+    # Target system subclasses will implement these individually
+
 
     @property
     @abstractmethod
@@ -45,13 +44,10 @@ class TargetSystem(ABC):
             - 'params': dict of named parameter values
         """
 
-    # ------------------------------------------------------------------
     # Shared simulation logic
-    # ------------------------------------------------------------------
-
     def simulate(
         self,
-        x0: np.ndarray,
+        y0: np.ndarray,
         t_span: tuple[float, float],
         t_eval: np.ndarray,
         noise_level: float = 0.0,
@@ -62,15 +58,13 @@ class TargetSystem(ABC):
 
         Parameters
         ----------
-        x0 : array of shape (n_species,)
-            Initial concentrations / state values.
+        y0 : array of shape (n_species,) -> initial concentrations / state values
         t_span : (t_start, t_end)
         t_eval : array of timepoints at which to return the solution.
         noise_level : float
             Standard deviation of additive Gaussian noise, scaled by the
-            RMS of each species trajectory (0 = clean data).
-        rng : numpy Generator, optional
-            For reproducible noise.
+            RMS of each species trajectory (0 = unmodified data)
+        rng : numpy Generator, optional -> reproducible noise
         **ivp_kwargs : passed to scipy.integrate.solve_ivp
 
         Returns
@@ -78,13 +72,11 @@ class TargetSystem(ABC):
         X : array of shape (len(t_eval), n_species)
             State matrix (rows = timepoints, columns = species).
         """
-        defaults = dict(method="RK45", rtol=1e-10, atol=1e-12, dense_output=False)
-        defaults.update(ivp_kwargs)
 
         sol = solve_ivp(self.rhs, 
-                        t_span, x0, 
+                        t_span, y0, 
                         t_eval=t_eval,
-                        method=ivp_kwargs.get("method", "RK45"),
+                        method=ivp_kwargs.get("method", "LSODA"),
                         rtol=ivp_kwargs.get("rtol", 1e-10),
                         atol=ivp_kwargs.get("atol", 1e-12),
                         dense_output=ivp_kwargs.get("dense_output", False), 
