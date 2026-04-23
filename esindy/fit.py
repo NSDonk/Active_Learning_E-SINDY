@@ -12,6 +12,7 @@ class SINDyResult:
     """Result from a single SINDy fit."""
     model: ps.SINDy
     coefficients: np.ndarray   # (n_features_in_library, n_species)
+    config: SINDyConfig = field(default_factory=SINDyConfig)
 
 
 @dataclass
@@ -79,6 +80,7 @@ def fit_sindy(
     return SINDyResult(
         model=model,
         coefficients=coefs.T,  # transpose to (n_library_terms, n_species)
+        config=config,
     )
 
 
@@ -97,9 +99,7 @@ def fit_esindy(
     t : array (n_timepoints,)
     config : SINDyConfig
     X_dot : optional pre-computed derivatives
-    n_bootstraps : number of bootstrap samples
     aggregation : 'mean' (bagging) or 'median' (bragging)
-    inclusion_threshold : threshold for zeroing low-probability terms
     seed : random seed
 
     Returns

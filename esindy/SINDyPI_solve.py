@@ -276,7 +276,8 @@ def simulate_sindy_pi(
     coef_precision: int = 4,
     ivp_method: str = 'LSODA',
 ) -> dict:
-    """Full SINDy-PI pipeline: select best models, solve implicitly, simulate forward.
+    """
+    Full SINDy-PI pipeline: select best models, solve implicitly, simulate forward.
 
     Parameters
     ----------
@@ -301,10 +302,10 @@ def simulate_sindy_pi(
     symbol_map = build_symbol_map(feature_names, species_names)
     feature_map = build_feature_map(feature_names, symbol_map)
 
-    # Step 1: select best candidate model per species
+    # select best candidate model per species
     best_models = select_best_sindy_pi_model(model, X_train, t_train)
 
-    # Step 2: solve implicit equation per species
+    # solve implicit equation per species
     solutions = {}
     rhs_functions = {}
 
@@ -334,7 +335,7 @@ def simulate_sindy_pi(
         rhs_k = sp.lambdify(state_symbols, solution, 'numpy')
         rhs_functions[k] = rhs_k
 
-    # Step 3: combine into single RHS for solve_ivp
+    # combine into single RHS for solve_ivp
     def rhs_combined(t, x):
         return [rhs_functions[k](*x) for k in range(len(species_names))]
 
@@ -378,6 +379,7 @@ def ensemble_forecast_sindy_pi(
     t_eval: np.ndarray,
     n_models: int = 20,
     seed: int = 0,
+    verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
 
     rng = np.random.default_rng(seed)
@@ -390,33 +392,35 @@ def ensemble_forecast_sindy_pi(
 
     # precompute true derivatives once
     x_wrapped = AxesArray(X_train, comprehend_axes(X_train))
-    X_dot_true = np.asarray(
-        model.differentiation_method(x_wrapped, t=t_train)
-    )[1:-1]
+    X_dot_true = np.asarray(model.differentiation_method(x_wrapped, t=t_train))[1:-1]
     X_dot_pred_all = np.asarray(model.predict(X_train))[1:-1]
 
     n_species = len(species_names)
     n_lib = all_coefs.shape[1]
     indices = rng.choice(n_bootstraps, size=n_models, replace=True)
 
-    # ── Phase 1: sequential — find best_j per species per member, solve sympy, cache ──
+    # Timing buckets
+    t_selection = 0.0   # best-candidate selection per member/species
+    t_sympy = 0.0       # sympy solve calls
+    t_lambdify = 0.0    # lambdify calls
+    n_sympy_calls = 0
+    n_cache_hits = 0
+
     solution_cache: dict[tuple, Optional[sp.Expr]] = {}
-    member_rhs: list[Optional[dict]] = []  # rhs_functions per member
+    member_rhs: list[Optional[dict]] = []
+
+    phase1_start = time.perf_counter()
 
     for idx in indices:
         coef_matrix = all_coefs[idx]
         rhs_functions = {}
         valid = True
-        
-        print(f"  [ensemble_forecast] Phase 1: solving sympy for {n_models} members...") # PRINT STATEMENT
 
         for k, species in enumerate(species_names):
-            
-            print(f"    member {i+1}/{n_models} - cache size: {len(solution_cache)}") # PRINT STATEMENT
-            
+            # selection
+            t0 = time.perf_counter()
             best_error = np.inf
             best_j = None
-
             for j in range(n_lib):
                 coefs_j = coef_matrix[j, :]
                 if np.all(coefs_j == 0):
@@ -430,42 +434,50 @@ def ensemble_forecast_sindy_pi(
                 if error < best_error:
                     best_error = error
                     best_j = j
+            t_selection += time.perf_counter() - t0
 
             if best_j is None:
                 valid = False
                 break
 
+            # sympy solve (cached)
             key = (k, coef_cache_key(coef_matrix[best_j, :]))
             if key not in solution_cache:
+                t0 = time.perf_counter()
                 deriv_symbol = symbol_map[f"{species}_t"]
                 solution_cache[key] = solve_species_equation(
                     coef_matrix[best_j, :], feature_names,
                     feature_map, deriv_symbol,
                 )
+                t_sympy += time.perf_counter() - t0
+                n_sympy_calls += 1
+            else:
+                n_cache_hits += 1
 
             solution = solution_cache[key]
             if solution is None:
                 valid = False
                 break
 
+            # lambdify
+            t0 = time.perf_counter()
             state_symbols = [symbol_map[s] for s in species_names]
             rhs_functions[k] = sp.lambdify(state_symbols, solution, 'numpy')
-        
-        print(f"  [ensemble_forecast] Phase 1 complete. Cache size: {len(solution_cache)}") # PRINT STATEMENT
+            t_lambdify += time.perf_counter() - t0
 
         member_rhs.append(rhs_functions if valid else None)
 
-    print(f"  [ensemble_forecast] Phase 2: running {len(member_rhs)} solve_ivp in parallel...") # PRINT STATEMENT
-    # ── Phase 2: parallel — solve_ivp per member ──
-    def _run_ivp(rhs_functions: Optional[dict]) -> Optional[np.ndarray]:
+    phase1_total = time.perf_counter() - phase1_start
+
+    # Phase 2
+    def _run_ivp(rhs_functions):
         if rhs_functions is None:
             return None
         def rhs_combined(t, x, _fns=rhs_functions):
             return [_fns[k](*x) for k in range(n_species)]
         try:
             sol = solve_ivp(
-                rhs_combined,
-                (t_eval[0], t_eval[-1]),
+                rhs_combined, (t_eval[0], t_eval[-1]),
                 x0, t_eval=t_eval,
                 method='LSODA', rtol=1e-8, atol=1e-10,
             )
@@ -473,15 +485,22 @@ def ensemble_forecast_sindy_pi(
         except Exception:
             return None
 
+    phase2_start = time.perf_counter()
     results_parallel = cast(
         list[Optional[np.ndarray]],
-        Parallel(n_jobs=-1)(
-            delayed(_run_ivp)(rhs) for rhs in member_rhs
-        )
+        Parallel(n_jobs=-1)(delayed(_run_ivp)(rhs) for rhs in member_rhs)
     )
+    phase2_total = time.perf_counter() - phase2_start
+
+    if verbose:
+        print(f"[ensemble_forecast_sindy_pi] n_models={n_models}, n_species={n_species}")
+        print(f"  Phase 1 total: {phase1_total:.2f}s")
+        print(f"    selection:  {t_selection:.2f}s")
+        print(f"    sympy:      {t_sympy:.2f}s  ({n_sympy_calls} calls, {n_cache_hits} cache hits)")
+        print(f"    lambdify:   {t_lambdify:.2f}s")
+        print(f"  Phase 2 total: {phase2_total:.2f}s")
 
     trajectories = [t for t in results_parallel if t is not None]
-
     if len(trajectories) == 0:
         n_t = len(t_eval)
         return np.full((n_t, n_species), np.nan), np.full((n_t, n_species), np.nan)

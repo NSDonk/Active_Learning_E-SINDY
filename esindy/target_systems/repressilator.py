@@ -26,9 +26,9 @@ class Repressilator(TargetSystem):
     def __init__(
         self,
         alpha: float = 216.0,
-        alpha_0: float = 0.216,
-        beta: float = 5.0,
-        n: float = 2.0,
+        alpha_0: float = 0.216, 
+        beta: float = 101.0, # protein half life
+        n: float = 2.0, # hill coefficient
     ):
         self.alpha = alpha      # maximal transcription rate
         self.alpha_0 = alpha_0  # leaky transcription rate
@@ -70,12 +70,7 @@ class Repressilator(TargetSystem):
                 "beta": self.beta,
                 "n": self.n,
             },
-            "active_terms": {
-                "note": (
-                    "Hill-function dynamics — not directly expressible as "
-                    "sparse polynomial terms. Evaluate via trajectory RMSE."
-                )
-            },
+            
         }
 
     @staticmethod

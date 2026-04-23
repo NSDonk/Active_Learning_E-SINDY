@@ -35,6 +35,7 @@ class SINDyConfig:
     use_ensemble: bool = False
     n_models: int = 20
     replace: bool = True
+    normalize_columns: bool = True
 
     # Differentiation
     diff_method: str = "smoothed_finite_difference"  # or "_finite_difference"
@@ -42,6 +43,8 @@ class SINDyConfig:
     
     # Input feature names for the state variables
     feature_names: Optional[list[str]] = None
+    
+    
     
     def build_library(self):
         if self.library_type == "polynomial":
@@ -85,12 +88,14 @@ class SINDyConfig:
                 threshold=self.threshold,
                 alpha=self.alpha,
                 max_iter=self.max_iter,
+                normalize_columns=self.normalize_columns
             )
         elif self.optimizer == "SINDyPI":
             base_opt = SINDyPI(
                 threshold=self.threshold,
                 alpha=self.alpha,
                 max_iter=self.max_iter,
+                normalize_columns=self.normalize_columns
             )
         else:
             raise ValueError(f"Optimizer '{self.optimizer}' not yet supported")
