@@ -6,3 +6,11 @@ results/
 dist/
 build/
 .env
+al_runs/
+esindy.zip 
+e-sindy.zip
+esindy_results.pkl
+e-sindy_active_learning_demo_COPY.ipynb 
+*.pkl
+*.zip
+*.png

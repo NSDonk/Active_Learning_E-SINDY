@@ -1,75 +1,112 @@
 """
 Active learning loop for E-SINDy.
 
-Implements the main AL loop and query strategies:
-- Random: uniformly random reveals
-- Forecast disagreement: reveal where ensemble variance is highest
+Implements the main AL loop and 4 query strategies:
+- Random: uniformly random selection (baseline)
+- Query by committee disagreement (Ensemble SINDy): variance across bootstrap models' predicted derivatives at each timepoint
+- Derivative residual (single SINDy model): |predicted difference - finite-difference derivative| per timepoint 
+- Implicit residual (single SINDyPI model): per-candidate leave-one-out reconstruction error of the implicit equations
+  *There's also an ensemble variant of the implicit residual for SINDy-PI*
 
-The loop operates on a pre-generated pool (data tensor with revealed mask)
-and iteratively reveals measurements, refits E-SINDy, and logs metrics.
+The loop operates on a pre-generated pool of initial conditions, trajectories are simulated up front, then iteratively selected, 
+appended to the labeled set, and the model is refit. Inclusion-probability stability is used as a stopping rule for ensemble runs.
+
 """
-
-from typing import Optional, Callable 
-from dataclasses import dataclass, field
+from typing import Optional, Callable
 
 import numpy as np
 from tqdm import tqdm
-import sympy as sp
+import joblib
+from pathlib import Path
+from datetime import datetime
+import warnings
+from scipy.integrate import solve_ivp
+from pysindy.utils import AxesArray, comprehend_axes
+
 from .SINDy_configs import SINDyConfig
+from .target_systems.base import TargetSystem
 from .fit import (
     ESINDyResult,
     SINDyResult,
     fit_sindy,
     fit_esindy,   
 )
-from .SINDyPI_solve import simulate_sindy_pi, ensemble_forecast_sindy_pi
-from .utils import get_revealed_data
-from .target_systems.hpt_axis import HPTAxis
-from scipy.integrate import solve_ivp
-from .target_systems.base import TargetSystem
-from pysindy.utils import AxesArray, comprehend_axes
 
 # Helper functions! 
-
-# to convert simulation outputs into SINDy ready format
-def to_sindy(species_order, sim_result) -> tuple[np.ndarray, np.ndarray]:
-        '''
-        Convert HPT simulation output to format suitable for SINDy.
-        '''
-        # time vector
-        t = sim_result['time']
-        # preserve species order for consistency with config.feature_names and interpretability
-        X = np.column_stack([sim_result['states'][s] for s in species_order])
-        return X, t
-
-# waaaay too many nested loops, just going to use this to dispatch the uncertainty metrics   
-def uncertainty_fn(config: SINDyConfig):
-    """
-    Route to the right uncertainty function based on optimizer + ensemble flag.
-    """
-    is_pi = config.optimizer == "SINDyPI"
-    if config.use_ensemble:
-        return trajectory_uncertainty_ensemble_pi if is_pi else trajectory_uncertainty_ensemble
-    else:
-        return trajectory_uncertainty_single_pi if is_pi else trajectory_uncertainty_single
-   
-# Query strategies
-def query_random(available_traj, rng):
-    # uniform random selection
-    return rng.integers(len(available_traj))
-
-# for generating initial condition pools
-def generate_ic_pool(
-    ranges: dict,
-    n_candidates: int = 50,
-    seed: int = 42,
-) -> list[dict]:
+# Generating initial condition pools
+def generate_ic_pool(ranges: dict[str, tuple[float, float]], n_candidates: int = 50, seed: int = 626,) -> list[np.ndarray]:
+    ''' 
+    Returns a list of initial conditions from which to generate the pool of trajectories
+    for active learning query selection. Note: user must pass ranges as a dictionary with
+    species in the same order as config.feature_names.
+    '''
     rng = np.random.default_rng(seed)
     pool = []
     for _ in range(n_candidates):
-        ic = {k: float(rng.uniform(low, high)) for k, (low, high) in ranges.items()}
+        ic = np.array([rng.uniform(low, high) for low, high in ranges.values()])
         pool.append(ic)
     return pool
+
+def save_run(run: dict, target_sys: TargetSystem, config: SINDyConfig, mode: str, out_dir: str | Path = "al_runs", tag: str | None = None, ) -> Path:
+    """
+    Save the data needed to plot/analyze an active learning run.
+    Drops the live pysindy model objects which hold unpicklable lambas from the CustomLibrary,
+    keeps coefficients, features, histories, training data and the IC pool. If the live model
+    is needed later then it can be refit  from the save X_train/t_train.
+
+    Parameters
+    ----------
+    run : dict
+        The dict returned by active_learning_loop.
+    target_sys, config, mode
+        Persisted alongside the results so plotting code can reconstruct
+        what was run without consulting external state.
+    out_dir : path
+        Directory to write into. Created if missing.
+    tag : optional string
+        Whatever additional naming convention you like. If None, a timestamp
+        is used.
+
+    Returns
+    -------
+    Path to the written file.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # just storing the name of the target system
+    sys_name = type(target_sys).__name__
+    optim = config.optimizer
+    ens = "ens" if config.use_ensemble else "single"
+    stamp = tag or datetime.now().strftime("%Y%m%d_%H%M%S")
+    # construct the file name
+    fname = f"{sys_name}_{optim}_{ens}_{mode}_{stamp}.joblib"
+    path = out_dir / fname
+    
+    payload = {
+        "results": [
+            {"coefficients": r.model.coefficients(),
+             "feature_names": r.model.get_feature_names()}
+            for r in run["results"]
+        ],
+        "X_train": run["X_train"],
+        "t_train": run["t_train"],
+        "test_pool": run["test_pool"],
+        "unqueried_ics": run["unqueried_ics "],
+        "prob_history": run["prob_history"],
+        "coefs_history": run.get("coefs_history", []),
+        "scores_history": run["scores_history"],
+        "target_sys": sys_name,
+        "mode": mode,
+    }
+    joblib.dump(payload, path, compress=3)
+    return path
+
+
+def load_run(path: str | Path) -> dict:
+    """Load a previously-saved AL run. Returns the full payload dict."""
+    return joblib.load(path)
+
 
 # Ensemble forecasting
 def ensemble_forecast(
@@ -77,7 +114,7 @@ def ensemble_forecast(
     x0: np.ndarray,
     t_eval: np.ndarray,
     n_models: int = 50,
-    seed: int = 0,
+    seed: int = 626,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate ensemble forecasts and compute variance.
 
@@ -143,6 +180,34 @@ def ensemble_forecast(
     var_traj = traj_array.var(axis=0)
 
     return mean_traj, var_traj
+
+# I had way too many nested loops, decided it was better to dispatch the uncertainty metrics   
+def get_uncertainty_fn(config: SINDyConfig) -> Callable:
+    """
+    Route to the right uncertainty function based on optimizer + ensemble flag.
+    
+    Ensemble branches: rank trajectories by committee disagreement (variance 
+    across bootstrap models' library-space predictions, summed over timepoints)
+    
+    Single model branches: rank trajectories by residual error between predicted
+    derivative and approximated ground truth. For STLSQ it's x_predicted - x_finite_difference
+    and for SINDyPI, it's per candidate implicit eq reconstruction error
+    """
+    is_pi = config.optimizer == "SINDyPI"
+    if config.use_ensemble:
+        return trajectory_uncertainty_ensemble_pi if is_pi else trajectory_uncertainty_ensemble
+    else:
+        return trajectory_uncertainty_single_pi if is_pi else trajectory_uncertainty_single
+   
+# Query strategies
+def query_random(n: int, rng:np.random.Generator) -> int:
+    '''
+    Random Query Selection: uniformly sample a random integer from among the 
+    length of the available remaining trajectories. Assumes n passed in equals
+    len(available_trajectories).
+    '''
+    # uniform random selection
+    return int(rng.integers(n))
 
 def trajectory_uncertainty_single(
     available_traj: np.ndarray,
@@ -232,41 +297,6 @@ def trajectory_uncertainty_ensemble(
 
     return float(var_per_timepoint.sum()), mask
 
-def trajectory_uncertainty_ensemble_pi(
-    available_traj: np.ndarray,
-    esindy_result: ESINDyResult,
-    points: int,
-) -> tuple[float, np.ndarray]:
-    """
-    Ensemble SINDy-PI: variance across library terms.
-    Variance is taken across models, summed across library terms and timepoints.
-    """
-    config = esindy_result.config
-    library = config.build_library()
-    all_coefs = esindy_result.all_coefficients  # (n_models, n_lib, n_lib) for PI
-    n_models = all_coefs.shape[0]
-
-    lib_features = np.asarray(library.fit_transform(available_traj))  # (n_t, n_lib)
-    n_lib = lib_features.shape[1]
-
-    # reconstruct each targeted library term per model
-    # reconstruction for candidate j: drop col j from lib_features, multiply by sparse coefficient vector (with 0 at j)
-    preds = np.array([
-        lib_features @ all_coefs[i]  # (n_t,n_lib)
-        for i in range(n_models)
-    ])  # (n_models, n_t, n_lib)
-
-    var_per_timepoint = preds.var(axis=0).sum(axis=1)  # (n_t,)
-    mask = var_per_timepoint > var_per_timepoint.mean()
-
-    min_points = max(20, int(points * 0.2))
-    if mask.sum() < min_points:
-        threshold = np.percentile(var_per_timepoint, 80)
-        mask = var_per_timepoint >= threshold
-
-    return float(var_per_timepoint.sum()), mask
-
-
 def trajectory_uncertainty_single_pi(
     available_traj: np.ndarray,
     sindy_result: SINDyResult,
@@ -276,7 +306,7 @@ def trajectory_uncertainty_single_pi(
     
     For each candidate library term that the model solved for, SINDy-PI
     learned an implicit equation candidate_j = candidate_library_{-j} x sparse_coefficient_vector_j. 
-    The residual candidate_j - candidate_library_{-j} x sparse_coefficient_vector_j.
+    The residual candidate_j - candidate_library_{-j} x sparse_coefficient_vector_j
     measures how well the fitted implicit equation holds on new data 
     regions where residuals are large are where the model's implicit relationships fail.
     
@@ -320,6 +350,41 @@ def trajectory_uncertainty_single_pi(
 
     return float(score_per_timepoint.sum()), mask
 
+
+def trajectory_uncertainty_ensemble_pi(
+    available_traj: np.ndarray,
+    esindy_result: ESINDyResult,
+    points: int,
+) -> tuple[float, np.ndarray]:
+    """
+    Ensemble SINDy-PI: variance across library terms.
+    Variance is taken across models, summed across library terms and timepoints.
+    """
+    config = esindy_result.config
+    library = config.build_library()
+    all_coefs = esindy_result.all_coefficients  # (n_models, n_lib, n_lib) for PI
+    n_models = all_coefs.shape[0]
+
+    lib_features = np.asarray(library.fit_transform(available_traj))  # (n_t, n_lib)
+    n_lib = lib_features.shape[1]
+
+    # reconstruct each targeted library term per model
+    # reconstruction for candidate j: drop col j from lib_features, multiply by sparse coefficient vector (with 0 at j)
+    preds = np.array([
+        lib_features @ all_coefs[i]  # (n_t,n_lib)
+        for i in range(n_models)
+    ])  # (n_models, n_t, n_lib)
+
+    var_per_timepoint = preds.var(axis=0).sum(axis=1)  # (n_t,)
+    mask = var_per_timepoint > var_per_timepoint.mean()
+
+    min_points = max(20, int(points * 0.2))
+    if mask.sum() < min_points:
+        threshold = np.percentile(var_per_timepoint, 80)
+        mask = var_per_timepoint >= threshold
+
+    return float(var_per_timepoint.sum()), mask
+
         
 def inclusion_probs_converged(
     history: list[np.ndarray],
@@ -332,20 +397,83 @@ def inclusion_probs_converged(
     recent = np.array(history[-window:])  # (window, n_lib, n_species)
     return float(np.std(recent, axis=0).mean()) < tol
 
+def coefs_converged(
+    coefs_history: list[np.ndarray],
+    window: int = 3,
+    support_threshold: float = 1e-6,
+) -> bool:
+    """
+    Single-model convergence criterion: stop when the set of active library terms per species 
+    has been identical for the last `window` iterations.
+
+    Parameters
+    ----------
+    coefs_history : list of (n_lib, n_species) coefficient arrays
+    window : how many recent iterations must agree
+    support_threshold : magnitude below which a coefficient is treated as zero
+
+    Returns
+    -------
+    True if support has been stable across the window.
+    """
+    if len(coefs_history) < window:
+        return False
+    
+    # build list of coefficient matrices to be compared
+    recent_supports = [(np.abs(coef) > support_threshold) for coef in coefs_history[-window:]]
+    
+    # pairwise comparison between 'oldest' and other coefficients
+    return all(np.array_equal(recent_supports[0], s) for s in recent_supports[1:])
 
 def active_learning_loop(
-    target_sys: TargetSystem,
-    params: Optional[dict] | None,   
-    ic_pool: list[dict],             # pool of candidate initial conditions
-    config: SINDyConfig,
-    mode: str,                       # trajectory_uncertainty or random_query
-    t_span: np.ndarray,
-    masking: bool = False,
-    n_init: int = 3,                 # initial random labeled set size
-    n_queries: int = 10,             # number of active learning iterations
-    n_test: int = 5,                   # ICs held out from ic_pool for final eval
-    seed: int = 42,
+    target_sys: TargetSystem,     # Repressilator, Lotka Volterra etc
+    params: Optional[dict],       # legacy from diff simulation, ignore
+    ic_pool:  list[np.ndarray],   # pool of candidate initial conditions
+    config: SINDyConfig,          # defines PySindy Model Construction
+    mode: str,                    # query select strategy: 'trajectory_uncertainty' or 'random_query'
+    t_span: np.ndarray,           # simulated trajectory runtime
+    masking: bool = False,        # whether to mask 'uninformative' timepoints
+    n_init: int = 3,              # initial random labeled set size
+    n_queries: int = 10,          # defines upper limit on # of active learning iterations
+    n_test: int = 5,              # ICs held out from ic_pool for final eval
+    seed: int = 626,
 ) -> dict:
+    
+    """
+    Pool-based active learning loop for SINDy / E-SINDy / SINDy-PI / E-SINDy-PI.
+
+    Parameters
+    ----------
+    target_sys : TargetSystem
+        Oracle ODE system; must implement .simulate(y0, t_span, t_eval).
+    ic_pool : list of arrays
+        Can pass the output of generate_ic_pool here
+        Candidate initial conditions. n_test are reserved for evaluation,
+        n_init seed the labeled set, the remainder form query pool.
+    config : SINDyConfig
+        User defined optimizer (STLSQ vs SINDy-PI), ensembling, function library, finite-differentiation method, etc.
+    mode : str
+        'trajectory_uncertainty' selects the highest-ranking IC each round
+        'random_query' selects uniformly at random.
+    t_span : np.ndarray
+        Time grid used for every simulation.
+    masking : bool
+        If True, append only the timepoints flagged as informative by the
+        uncertainty function (top-residual or top-variance points).
+    n_init, n_queries, n_test : int
+    seed : int
+        Controls test/init splits and any RNG-using selection step.
+
+    Returns
+    -------
+    dict with keys:
+        'results' : list of (E)SINDyResult, one per iteration
+        'X_train' : list of trajectories used to fit
+        't_train' : list of time vectors used to fit
+        'test_pool' : ICs held out for evaluation
+        'prob_history' : list of inclusion-prob arrays (ensemble runs only)
+        'scores_history' : list of scalar scores logged per query
+    """
             
     rng = np.random.default_rng(seed)
     
@@ -359,227 +487,115 @@ def active_learning_loop(
     init_labeled = [train_pool[i] for i in init_idx]
     remaining_pool = [ic for i, ic in enumerate(train_pool) if i not in init_idx]
     
-    # simulate and concatenate the trajectories and time vectors in remaining pool
+    # simulate the remaining trajectories to be queried up front to build pool
     available_traj = []
     available_time = []
-    for i in remaining_pool:
-        X_full = target_sys.simulate(y0=np.array(i), t_span=(t_span[0], t_span[-1]), t_eval=t_span) 
-        available_traj.append(X_full)
+    available_ics = list(remaining_pool) # we'll return at the end to investigate unqueried ICs
+    
+    for ic in remaining_pool:
+        X = target_sys.simulate(y0=np.array(ic), t_span=(t_span[0], t_span[-1]), t_eval=t_span) 
+        available_traj.append(X)
         available_time.append(t_span)
 
+    # instantiate lists for storing labeled trajectories and their timepoints
     X_labeled_list = []
-    holdouts = []  # list of (X_holdout, t_holdout) per labeled trajectory
     t_list = []
     
-    # simulate and concatenate initial trajectories
+    # simulate and concatenate the initial trajectories, # defined by n_init parameter
     for ic in init_labeled:
-        X_full = target_sys.simulate(y0=np.array(ic), t_span=(t_span[0], t_span[-1]), t_eval=t_span) 
-        X_labeled_list.append(X_full)
-        holdouts.append((X_full, t_span))
+        X = target_sys.simulate(y0=np.array(ic), t_span=(t_span[0], t_span[-1]), t_eval=t_span) 
+        X_labeled_list.append(X)
         t_list.append(t_span) # shared timepoints for train portion
 
-    final_results = []
-    prob_history = []
-    scores_history = []
-    for q in range(n_queries): 
+    # instantiate lists for collecting: 
+    final_results = []  # stores fitted model at every iteration
+    prob_history = []   # store per iteration inclusion probabilities for ensemble model covergence criteria and visualization 
+    coefs_history = []  # store per iteration regression coefficients for single model covergence criteria and visualization 
+    scores_history = [] # stores per iteration value of uncertainty metric
+    
+    uncertainty_function = get_uncertainty_fn(config)    
+     
+    with warnings.catch_warnings():
+        # AxesArray labels 2 axes when SINDy-PI transiently re-wraps a 1D array
+        # during library evaluation. Metadata-only, no numerical impact.
+        warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysindy")
         
-        if len(remaining_pool) == 0: # if for some reason we have allowed more queries than available trajectories
-            break
-        
-        # fit E-SINDy or SINDy on current labeled set
-        if mode == 'trajectory_uncertainty':
-            if config.use_ensemble:
-                result = fit_esindy(X_labeled_list, t_list, config)
-                final_results.append(result)
-                prob_history.append(result.inclusion_probabilities)
-            else:
-                result = fit_sindy(X_labeled_list, t_list, config)
-                final_results.append(result)
-                
-            uncertainty_function = uncertainty_fn(config)
-                
-            # compute highest uncertainty IC
-            # store scores and mask for holdout time points 
-            scores = []
-            masks = []
-            for traj in available_traj:
-                s, m = uncertainty_function(traj, result, points=len(traj))
-                scores.append(s)
-                masks.append(m)
-
-            max_uncertainty = np.argmax(scores) # idx of the ic for which the std was highest -> most disagreement 
-            X_full, t_full = available_traj[max_uncertainty], available_time[max_uncertainty]
-            mask = masks[max_uncertainty]
+        pbar = tqdm(range(n_queries), desc=f"AL ({mode})", unit="query")
+        for q in pbar:
             
-            # from the query for the highest variance IC, testing whether 
-            # keeping only "informative" timepoints improves accuracy / convergence
-            if not masking:
-                X_labeled_list.append(X_full) # append all the timepoints from IC trajectory for which models were most uncertain
-                t_list.append(t_full)
-            else:
-                X_labeled_list.append(X_full[mask]) # only append the specific timepoints for which the models were most uncertain
-                t_list.append(t_full[mask])
-                holdouts.append((X_full[~mask], t_full[~mask]))
-            
-            # Per iteration reporting
-            scores_history.append(scores[max_uncertainty])
-            print(f"Query {q+1}: score={scores[max_uncertainty]:.4f}, kept {mask.sum()}/{len(mask)} timepoints")
-            
-            # Remove queried point from pool of trajectories & times
-            available_traj.pop(max_uncertainty)
-            available_time.pop(max_uncertainty)
-            remaining_pool.pop(max_uncertainty)
-            
-            # check to see if the model converged in which case break
-            if inclusion_probs_converged(prob_history):
-                print(f"Converged at iteration {q+1}")
+            if len(available_traj) == 0: # if for some reason we have allowed more queries than available trajectories
+                pbar.write(f"Pool exhausted at iteration {q}")
                 break
         
-            
-        else: # random_query
+            # fit E-SINDy or SINDy on current labeled set
             if config.use_ensemble:
                 result = fit_esindy(X_labeled_list, t_list, config)
-                final_results.append(result)
                 prob_history.append(result.inclusion_probabilities)
-                
+                coefs_history.append(result.model.coefficients()) 
             else:
                 result = fit_sindy(X_labeled_list, t_list, config)
-                final_results.append(result)
-            
-            uncertainty_function = uncertainty_fn(config)
+                coefs_history.append(result.model.coefficients())  # (n_lib, n_species)
                 
-            # compute highest uncertainty IC
-            # store scores for reporting
+            # store fitted model
+            final_results.append(result)    
             
-            # random query
-            rand_idx = query_random(available_traj, rng)
+            # temp storage uncertainty scores + masks, no need to rewrite lists each iteration of AL loop
+            best_score = -np.inf
+            best_idx = 0
+            best_mask = None
             
-            s, _ = uncertainty_function(available_traj[rand_idx], result, points=len(available_traj[rand_idx]))
-                            
-            X_labeled_list.append(available_traj[rand_idx]) 
-            t_list.append(available_time[rand_idx])
+            # select highest uncertainty IC from among available trajectories based on mode
+            if mode == "trajectory_uncertainty":    
+                for i, traj in enumerate(available_traj):
+                    s, m = uncertainty_function(traj, result, points=len(traj))
+                    if s > best_score:
+                        best_score = s
+                        best_idx= i
+                        best_mask = m
             
-            # Per iteration reporting
-            scores_history.append(s)
-            print(f"Query {q+1}: score={s:.4f}")
-            
-            # Remove queried point from pool of trajectories
-            available_traj.pop(rand_idx)  
-            available_time.pop(rand_idx)
-            remaining_pool.pop(rand_idx) 
-            
-            # check to see if the model converged in which case break
-            if inclusion_probs_converged(prob_history):
-                print(f"Converged at iteration {q+1}")
-                break   
+            else:  # random_query
+                best_idx = query_random(len(available_traj), rng)
+                best_score, best_mask = uncertainty_function(available_traj[best_idx], result, points=len(available_traj[best_idx]))
 
-            
+            # append (optionally masked trajectory to labeled set)    
+            X_full, t_full = available_traj[best_idx], available_time[best_idx]
+                
+            # when masking = true, keeping only "informative" timepoints  to see if it improves accuracy / convergence
+            if masking:
+                X_labeled_list.append(X_full[best_mask]) # only append the specific timepoints for which the models were most uncertain 
+                t_list.append(t_full[best_mask])
+            else:
+                X_labeled_list.append(X_full) # append all the timepoints from IC trajectory for which models were most uncertain
+                t_list.append(t_full)
+                
+            # Per iteration reporting
+            scores_history.append(best_score)
+            kept = best_mask.sum() if (masking and best_mask is not None) else len(t_full) # little janky but I can't stand pylance warnings so it stands
+            pbar.set_postfix(score=f"{best_score:.2e}", kept=f"{kept}/{len(t_full)}")
+                
+            # Remove queried point from pool of trajectories & times
+            available_traj.pop(best_idx)
+            available_time.pop(best_idx)
+            available_ics.pop(best_idx)
+
+                            
+            # check to see if the model converged (currently only relevant for ensemble)in which case break
+            if config.use_ensemble: 
+                if inclusion_probs_converged(prob_history):
+                    pbar.write(f"Converged (inclusion probs) at iteration {q+1}")
+                    break 
+            else: 
+                if coefs_converged(coefs_history):
+                    pbar.write(f"Converged (coefficient support) at iteration {q+1}")
+                    break
+                
     return {
             'results': final_results,           # list of ESINDy|SINDy Result per iteration
             'X_train': X_labeled_list,
             't_train': t_list,
             'test_pool': test_pool,       # held-out ICs for final evaluation
             'prob_history': prob_history,
+            'coefs_history': coefs_history,
             'scores_history': scores_history,
+            'unqueried_ics': available_ics,
         }
-
-
-
-
-# # AL loop HPT
-# def HPT_active_learning_loop(
-#     runner: Optional[Callable],      # biomolecular_controllers runner
-#     target_sys: Optional[Callable],
-#     params: Optional[dict] | None,   # HPTAxis has default params if None
-#     ic_pool: list[dict],             # pool of candidate initial conditions
-#     n_init: int = 3,                 # initial random labeled set size
-#     n_queries: int = 10,             # number of active learning iterations
-#     t_span: tuple = (0, 12e6),
-#     points: int = 1000,
-#     n_test: int = 5,                   # ICs held out from ic_pool for final eval
-#     eval_every: int = 10,
-#     config: Optional[SINDyConfig] = None,
-#     seed: int = 42,
-# ) -> dict:
-
-#     if runner:
-#         converter = HPTAxis() # for converting HPT sim output to SINDy format
-        
-#     rng = np.random.default_rng(seed)
-    
-#     # carve out test set before anything else
-#     test_idx = rng.choice(len(ic_pool), size=n_test, replace=False)
-#     test_pool = [ic_pool[i] for i in test_idx]
-#     train_pool = [ic for i, ic in enumerate(ic_pool) if i not in test_idx]
-    
-#     # Step 1: initial random labeled set
-#     init_idx = rng.choice(len(train_pool), size=n_init, replace=False)
-#     labeled = [train_pool[i] for i in init_idx]
-#     remaining_pool = [ic for i, ic in enumerate(train_pool) if i not in init_idx]
-    
-#     # simulate and concatenate initial trajectories
-#     X_labeled_list = []
-#     holdouts = []  # list of (X_holdout, t_holdout) per labeled trajectory
-#     t_list = []
-    
-
-#     for ic in labeled:
-#         if runner:
-#             s = runner.run_deterministic('HPT_full', t_span=t_span, points=points, params=params, ic=ic)
-#             X_full, t_full = converter.hpt_to_sindy(s)
-#             X_labeled_list.append(X_full)
-#             holdouts.append((X_full, t_full))
-#             t_list.append(t_full) # shared timepoints for train portion
-#         else: 
-            
-           
-    
-#     results = []
-#     prob_history = []
-#     scores_history = []
-#     for q in range(n_queries):
-#         # Step 2: fit E-SINDy or SINDy on current labeled set
-#         if config.use_ensemble:
-#             e_result = fit_esindy(X_labeled_list, t_list, config)
-#         else:
-#             sindy_result = fit_sindy(X_labeled_list, t_list, config)
-            
-#         results.append(e_result)
-#         prob_history.append(e_result.inclusion_probabilities)
-        
-#         if inclusion_probs_converged(prob_history):
-#             print(f"Converged at iteration {q+1}")
-#             break
-        
-#         # Step 3: compute highest uncertainty IC
-#         scores = []
-#         trajectories = []
-#         for ic in remaining_pool:
-#             s = runner.run_deterministic('HPT_full', t_span=t_span, points=points, params=params, ic=ic)
-#             X_full, t_full = converter.hpt_to_sindy(s)
-#             score, mask = trajectory_uncertainty(X_full, e_result)
-#             scores.append(score)
-#             trajectories.append((X_full, t_full, mask))
-
-#         # Step 4: query highest variance IC, keep only informative timepoints
-#         best_idx = np.argmax(scores)
-#         best_ic = remaining_pool.pop(best_idx)
-#         X_full_new, t_full_new, mask = trajectories[best_idx]
-
-#         X_labeled_list.append(X_full_new[mask])
-#         t_list.append(t_full_new[mask])
-#         holdouts.append((X_full_new[~mask], t_full_new[~mask]))
-#         scores_history.append(scores[best_idx])
-#         print(f"Query {q+1}: score={scores[best_idx]:.4f}, kept {mask.sum()}/{len(mask)} timepoints")  
-        
-#         converged = inclusion_probs_converged(prob_history)
-
-#         if converged:
-#             break
-
-#     return {
-#             'results': results,           # list of ESINDyResult per iteration
-#             'test_pool': test_pool,       # held-out ICs for final evaluation
-#             'prob_history': prob_history,
-#             'scores_history': scores_history,
-#         }

@@ -1,0 +1,72 @@
+"""
+Toggle switch (Gardner, Cantor & Collins, Nature 2000).
+
+Two mutually-repressing genes — a canonical synthetic biology bistable circuit.
+
+    du/dt = alpha_1 / (1 + v^beta) - u
+    dv/dt = alpha_2 / (1 + u^gamma) - v
+
+For alpha_1, alpha_2 > ~1.5 and beta, gamma >= 2, the system is bistable
+with two stable fixed points separated by a saddle point. Initial condition
+selection matters: ICs near the separatrix produce information-rich transients,
+while ICs in the basins race to the fixed points.
+
+State vector: [u, v]
+
+The Hill-function nonlinearities are rational, not polynomial — this system
+is genuine SINDy-PI territory.
+"""
+
+import numpy as np
+from .base import TargetSystem
+
+
+class ToggleSwitch(TargetSystem):
+
+    def __init__(
+        self,
+        alpha_1: float = 3.0,
+        alpha_2: float = 3.0,
+        beta: float = 2.0,
+        gamma: float = 2.0,
+    ):
+        self.alpha_1 = alpha_1
+        self.alpha_2 = alpha_2
+        self.beta = beta
+        self.gamma = gamma
+
+    @property
+    def n_species(self) -> int:
+        return 2
+
+    @property
+    def species_names(self) -> list[str]:
+        return ["u", "v"]
+
+    def rhs(self, t: float, x: np.ndarray) -> np.ndarray:
+        u, v = x
+        du = self.alpha_1 / (1.0 + v ** self.beta) - u
+        dv = self.alpha_2 / (1.0 + u ** self.gamma) - v
+        return np.array([du, dv])
+
+    def get_true_coefficients(self) -> dict:
+        return {
+            "params": {
+                "alpha_1": self.alpha_1,
+                "alpha_2": self.alpha_2,
+                "beta": self.beta,
+                "gamma": self.gamma,
+            },
+        }
+
+    @staticmethod
+    def default_ic_ranges() -> list[tuple[float, float]]:
+        """IC range chosen to span both basins and the separatrix region."""
+        return [
+            (0.0, 5.0),  # u
+            (0.0, 5.0),  # v
+        ]
+
+    @staticmethod
+    def default_t_eval(n_points: int = 500) -> np.ndarray:
+        return np.linspace(0, 20, n_points)
